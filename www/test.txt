@@ -1,0 +1,2 @@
+This is a static text file.
+Served by the C++ epoll HTTP server v0.3.

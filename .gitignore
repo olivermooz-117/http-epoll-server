@@ -1,0 +1,14 @@
+# Compiled binaries
+server
+*.o
+*.out
+
+# Build directories
+build/
+
+# Editor files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
