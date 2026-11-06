@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -21,10 +22,16 @@
 constexpr int PORT = 8080;
 constexpr int MAX_EVENTS = 1024;
 constexpr int BACKLOG = 128;
+
 constexpr size_t MAX_HEADER_SIZE = 16384;
 constexpr size_t MAX_BUFFER_SIZE = 1024 * 1024;
 
+constexpr int KEEP_ALIVE_TIMEOUT_SECONDS = 30;
+constexpr int MAX_REQUESTS_PER_CONNECTION = 100;
+constexpr int EPOLL_WAIT_TIMEOUT_MS = 1000;
+
 namespace fs = std::filesystem;
+using Clock = std::chrono::steady_clock;
 
 const fs::path WWW_ROOT = "www";
 
@@ -43,10 +50,13 @@ struct Connection {
     std::string write_buf;
 
     size_t write_offset = 0;
+    size_t request_count = 0;
 
     bool response_ready = false;
     bool keep_alive = false;
     bool peer_closed = false;
+
+    Clock::time_point last_activity = Clock::now();
 
     explicit Connection(int socket_fd) : fd(socket_fd) {}
 };
@@ -127,8 +137,7 @@ std::string lowercase(std::string value) {
 bool valid_header_name(const std::string& name) {
     if (name.empty()) return false;
 
-    const std::string allowed =
-        "!#$%&'*+-.^_`|~";
+    const std::string allowed = "!#$%&'*+-.^_`|~";
 
     for (unsigned char c : name) {
         if (!std::isalnum(c) && allowed.find(c) == std::string::npos) {
@@ -163,7 +172,7 @@ ParseResult parse_request(
 
     if (header_end == std::string::npos) {
         if (buffer.size() > MAX_HEADER_SIZE) {
-            error_status = 400;
+            error_status = 431;
             return ParseResult::INVALID;
         }
 
@@ -171,15 +180,13 @@ ParseResult parse_request(
     }
 
     if (header_end > MAX_HEADER_SIZE) {
-        error_status = 400;
+        error_status = 431;
         return ParseResult::INVALID;
     }
 
     consumed = header_end + 4;
 
-    std::istringstream stream(
-        buffer.substr(0, header_end)
-    );
+    std::istringstream stream(buffer.substr(0, header_end));
 
     std::string request_line;
 
@@ -193,7 +200,6 @@ ParseResult parse_request(
     }
 
     std::istringstream line(request_line);
-
     std::string extra;
 
     if (!(line >> req.method >> req.path >> req.version) ||
@@ -351,7 +357,6 @@ bool decode_url_path(
             if (hi < 0 || lo < 0) return false;
 
             c = static_cast<unsigned char>((hi << 4) | lo);
-
             i += 2;
         }
 
@@ -435,9 +440,6 @@ bool load_file(
             return false;
         }
 
-        std::ifstream* unused = nullptr;
-        (void)unused;
-
         int file_fd = open(target.c_str(), O_RDONLY | O_CLOEXEC);
 
         if (file_fd < 0) {
@@ -513,10 +515,14 @@ std::string make_response(
              << "\r\n";
 
     if (keep_alive) {
-        response << "Keep-Alive: timeout=30, max=100\r\n";
+        response << "Keep-Alive: timeout="
+                 << KEEP_ALIVE_TIMEOUT_SECONDS
+                 << ", max="
+                 << MAX_REQUESTS_PER_CONNECTION
+                 << "\r\n";
     }
 
-    response << "Server: epoll-http/0.3\r\n";
+    response << "Server: epoll-http/0.4\r\n";
     response << "\r\n";
 
     if (!head_request) {
@@ -556,6 +562,8 @@ void prepare_response(Connection& conn) {
     } else {
         conn.read_buf.erase(0, consumed);
 
+        ++conn.request_count;
+
         std::string body;
         std::string resolved_path;
         int status = 200;
@@ -568,7 +576,9 @@ void prepare_response(Connection& conn) {
             body = status_text(status) + "\n";
         }
 
-        conn.keep_alive = req.keep_alive;
+        conn.keep_alive =
+            req.keep_alive &&
+            conn.request_count < MAX_REQUESTS_PER_CONNECTION;
 
         conn.write_buf = make_response(
             success ? 200 : status,
@@ -581,6 +591,7 @@ void prepare_response(Connection& conn) {
 
         std::cout << req.method << " " << req.path
                   << " -> " << (success ? 200 : status)
+                  << " [request " << conn.request_count << "]"
                   << (conn.keep_alive ? " [keep-alive]" : " [close]")
                   << "\n";
     }
@@ -597,6 +608,29 @@ void close_connection(
     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
     close(fd);
     connections.erase(fd);
+}
+
+void cleanup_idle_connections(
+    int epfd,
+    std::unordered_map<int, std::unique_ptr<Connection>>& connections
+) {
+    const auto now = Clock::now();
+
+    std::vector<int> expired;
+
+    for (const auto& item : connections) {
+        const Connection& conn = *item.second;
+
+        if (now - conn.last_activity >=
+            std::chrono::seconds(KEEP_ALIVE_TIMEOUT_SECONDS)) {
+            expired.push_back(conn.fd);
+        }
+    }
+
+    for (int fd : expired) {
+        std::cout << "Connection timed out: " << fd << "\n";
+        close_connection(epfd, fd, connections);
+    }
 }
 
 void update_events(int epfd, Connection& conn) {
@@ -645,17 +679,25 @@ int main() {
     epoll_event events[MAX_EVENTS];
 
     std::cout << "====================================\n";
-    std::cout << "     EPOLL HTTP SERVER v0.3\n";
+    std::cout << "     EPOLL HTTP SERVER v0.4\n";
     std::cout << "====================================\n";
     std::cout << "Listening: http://127.0.0.1:"
               << PORT << "\n";
     std::cout << "Document root: " << WWW_ROOT << "\n";
-    std::cout << "Keep-Alive: enabled\n";
+    std::cout << "Keep-Alive timeout: "
+              << KEEP_ALIVE_TIMEOUT_SECONDS << " seconds\n";
+    std::cout << "Maximum requests per connection: "
+              << MAX_REQUESTS_PER_CONNECTION << "\n";
     std::cout << "Methods: GET, HEAD\n";
     std::cout << "====================================\n";
 
     while (true) {
-        int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
+        int n = epoll_wait(
+            epfd,
+            events,
+            MAX_EVENTS,
+            EPOLL_WAIT_TIMEOUT_MS
+        );
 
         if (n < 0) {
             if (errno == EINTR) continue;
@@ -668,7 +710,6 @@ int main() {
             int fd = events[i].data.fd;
             uint32_t flags = events[i].events;
 
-            // Accept new clients.
             if (fd == listen_fd) {
                 while (true) {
                     sockaddr_in client_addr{};
@@ -737,7 +778,6 @@ int main() {
 
             bool failed = false;
 
-            // Read incoming data.
             if (flags & EPOLLIN) {
                 char buffer[8192];
 
@@ -747,6 +787,8 @@ int main() {
                     );
 
                     if (bytes > 0) {
+                        conn.last_activity = Clock::now();
+
                         conn.read_buf.append(
                             buffer, static_cast<size_t>(bytes)
                         );
@@ -777,7 +819,6 @@ int main() {
                 continue;
             }
 
-            // Build response when a complete request is available.
             if (!conn.response_ready && !conn.read_buf.empty()) {
                 prepare_response(conn);
             }
@@ -786,7 +827,6 @@ int main() {
                 update_events(epfd, conn);
             }
 
-            // Write response, handling partial writes.
             if ((flags & EPOLLOUT) && conn.response_ready) {
                 while (conn.write_offset < conn.write_buf.size()) {
                     ssize_t bytes = send(
@@ -799,6 +839,8 @@ int main() {
                     if (bytes > 0) {
                         conn.write_offset +=
                             static_cast<size_t>(bytes);
+
+                        conn.last_activity = Clock::now();
                     } else if (bytes < 0 && errno == EINTR) {
                         continue;
                     } else if (bytes < 0 &&
@@ -817,7 +859,6 @@ int main() {
                 continue;
             }
 
-            // Finished sending the response.
             if (conn.response_ready &&
                 conn.write_offset == conn.write_buf.size()) {
 
@@ -830,7 +871,8 @@ int main() {
                 conn.write_offset = 0;
                 conn.response_ready = false;
 
-                // Handle another already-buffered request.
+                conn.last_activity = Clock::now();
+
                 if (!conn.read_buf.empty()) {
                     prepare_response(conn);
                 }
@@ -838,6 +880,8 @@ int main() {
                 update_events(epfd, conn);
             }
         }
+
+        cleanup_idle_connections(epfd, connections);
     }
 
     for (auto& item : connections) {

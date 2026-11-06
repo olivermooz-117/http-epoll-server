@@ -1,11 +1,26 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>EPOLL HTTP Server</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EPOLL HTTP Server v0.4</title>
 </head>
 <body>
-    <h1>Hello from epoll server v0.3!</h1>
-    <p>HTTP/1.1 Keep-Alive is enabled.</p>
+    <h1>Hello from epoll server v0.4!</h1>
+
+    <p>A lightweight HTTP/1.1 server built using C++17 and Linux epoll.</p>
+
+    <h2>Features</h2>
+    <ul>
+        <li>Non-blocking TCP sockets</li>
+        <li>Linux epoll event handling</li>
+        <li>HTTP/1.1 GET and HEAD methods</li>
+        <li>Persistent Keep-Alive connections</li>
+        <li>30-second idle connection timeout</li>
+        <li>Maximum 100 requests per connection</li>
+        <li>Static file serving and MIME types</li>
+        <li>Partial socket read and write handling</li>
+        <li>HTTP error responses</li>
+    </ul>
 </body>
 </html>
