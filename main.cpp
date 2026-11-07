@@ -823,6 +823,11 @@ int main() {
                 prepare_response(conn);
             }
 
+            if (conn.peer_closed && !conn.response_ready) {
+                close_connection(epfd, fd, connections);
+                continue;
+            }
+
             if (conn.response_ready) {
                 update_events(epfd, conn);
             }
