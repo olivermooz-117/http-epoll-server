@@ -25,7 +25,7 @@ constexpr int DEFAULT_PORT = 8080;
 constexpr int MAX_EVENTS = 1024;
 constexpr int BACKLOG = 128;
 constexpr int MAX_CONNECTIONS = 10000;
-constexpr const char* SERVER_VERSION = "0.5.1";
+constexpr const char* SERVER_VERSION = "0.5.2";
 
 constexpr size_t MAX_HEADER_SIZE = 16384;
 constexpr size_t MAX_BUFFER_SIZE = 1024 * 1024;
@@ -82,8 +82,16 @@ bool set_nonblocking(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
 }
 
+bool set_close_on_exec(int fd) {
+    int flags = fcntl(fd, F_GETFD, 0);
+
+    if (flags == -1) return false;
+
+    return fcntl(fd, F_SETFD, flags | FD_CLOEXEC) != -1;
+}
+
 int create_server_socket(int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 
     if (fd < 0) {
         perror("socket");
@@ -321,7 +329,8 @@ ParseResult parse_request(
     }
 
     if (req.version == "HTTP/1.1" &&
-        !req.headers.count("host")) {
+        (!req.headers.count("host") ||
+         req.headers["host"].empty())) {
         error_status = 400;
         return ParseResult::INVALID;
     }
@@ -459,6 +468,8 @@ bool load_file(
     std::string& resolved_path,
     int& status
 ) {
+    constexpr size_t MAX_STATIC_FILE_SIZE = 10 * 1024 * 1024;
+
     std::string path_only = url_path.substr(
         0, url_path.find('?')
     );
@@ -480,49 +491,102 @@ bool load_file(
     }
 
     fs::path relative = fs::path(decoded).relative_path();
+    std::vector<std::string> components;
 
     for (const auto& component : relative) {
-        if (component == "..") {
+        std::string part = component.string();
+
+        if (part.empty() || part == ".") {
+            continue;
+        }
+
+        if (part == "..") {
             status = 400;
             return false;
         }
+
+        components.push_back(part);
+    }
+
+    if (components.empty()) {
+        status = 404;
+        return false;
     }
 
     try {
         fs::path root = fs::canonical(WWW_ROOT);
-        fs::path target = fs::weakly_canonical(root / relative);
 
-        if (!is_inside_root(root, target)) {
-            status = 400;
-            return false;
-        }
+        int dir_fd = open(
+            root.c_str(),
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC
+        );
 
-        if (!fs::is_regular_file(target)) {
-            status = 404;
-            return false;
-        }
-
-        if (fs::file_size(target) > 10 * 1024 * 1024) {
+        if (dir_fd < 0) {
             status = 500;
             return false;
         }
 
-        int file_fd = open(target.c_str(), O_RDONLY | O_CLOEXEC);
+        int file_fd = -1;
 
-        if (file_fd < 0) {
-            status = (errno == ENOENT || errno == EACCES)
-                ? 404 : 500;
-            return false;
+        for (size_t i = 0; i < components.size(); ++i) {
+            const bool final_component = (i + 1 == components.size());
+
+            int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW;
+
+            if (!final_component) {
+                flags |= O_DIRECTORY;
+            }
+
+            int next_fd = openat(
+                dir_fd,
+                components[i].c_str(),
+                flags
+            );
+
+            int saved_errno = errno;
+            close(dir_fd);
+            errno = saved_errno;
+
+            if (next_fd < 0) {
+                if (errno == ELOOP) {
+                    status = 400;
+                } else if (
+                    errno == ENOENT ||
+                    errno == ENOTDIR ||
+                    errno == EACCES
+                ) {
+                    status = 404;
+                } else {
+                    status = 500;
+                }
+
+                return false;
+            }
+
+            dir_fd = next_fd;
         }
+
+        file_fd = dir_fd;
 
         struct stat file_stat{};
 
-        if (fstat(file_fd, &file_stat) < 0 ||
-            !S_ISREG(file_stat.st_mode) ||
-            file_stat.st_size < 0 ||
-            file_stat.st_size > 10 * 1024 * 1024) {
+        if (fstat(file_fd, &file_stat) < 0) {
             close(file_fd);
-            status = (file_stat.st_size > 10 * 1024 * 1024) ? 500 : 404;
+            status = 500;
+            return false;
+        }
+
+        if (!S_ISREG(file_stat.st_mode)) {
+            close(file_fd);
+            status = 404;
+            return false;
+        }
+
+        if (file_stat.st_size < 0 ||
+            static_cast<uint64_t>(file_stat.st_size) >
+                MAX_STATIC_FILE_SIZE) {
+            close(file_fd);
+            status = 500;
             return false;
         }
 
@@ -535,12 +599,20 @@ bool load_file(
 
             if (n > 0) {
                 body.append(buffer, static_cast<size_t>(n));
+
+                if (body.size() > MAX_STATIC_FILE_SIZE) {
+                    close(file_fd);
+                    body.clear();
+                    status = 500;
+                    return false;
+                }
             } else if (n == 0) {
                 break;
             } else if (errno == EINTR) {
                 continue;
             } else {
                 close(file_fd);
+                body.clear();
                 status = 500;
                 return false;
             }
@@ -548,12 +620,12 @@ bool load_file(
 
         close(file_fd);
 
-        resolved_path = target.string();
+        resolved_path = (root / relative).string();
 
         return true;
 
     } catch (const fs::filesystem_error&) {
-        status = 404;
+        status = 500;
         return false;
     }
 }
@@ -734,7 +806,7 @@ bool send_response(int fd, Connection& conn) {
     return false;
 }
 
-void update_events(int epfd, Connection& conn) {
+bool update_events(int epfd, Connection& conn) {
     epoll_event ev{};
 
     ev.events = EPOLLIN | EPOLLRDHUP;
@@ -746,7 +818,7 @@ void update_events(int epfd, Connection& conn) {
 
     ev.data.fd = conn.fd;
 
-    epoll_ctl(epfd, EPOLL_CTL_MOD, conn.fd, &ev);
+    return epoll_ctl(epfd, EPOLL_CTL_MOD, conn.fd, &ev) == 0;
 }
 
 void handle_shutdown(int) {
@@ -785,7 +857,7 @@ int main(int argc, char** argv) {
 
     if (listen_fd < 0) return 1;
 
-    int epfd = epoll_create1(0);
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
 
     if (epfd < 0) {
         perror("epoll_create1");
@@ -887,7 +959,8 @@ int main(int argc, char** argv) {
                         continue;
                     }
 
-                    if (!set_nonblocking(client_fd)) {
+                    if (!set_nonblocking(client_fd) ||
+                        !set_close_on_exec(client_fd)) {
                         close(client_fd);
                         continue;
                     }
@@ -950,7 +1023,20 @@ int main(int argc, char** argv) {
                         );
 
                         if (conn.read_buf.size() > MAX_BUFFER_SIZE) {
-                            failed = true;
+                            const std::string body = "Content Too Large\n";
+
+                            conn.read_buf.clear();
+                            conn.write_buf = make_response(
+                                413,
+                                "text/plain; charset=utf-8",
+                                body,
+                                false,
+                                false
+                            );
+
+                            conn.write_offset = 0;
+                            conn.response_ready = true;
+                            conn.keep_alive = false;
                             break;
                         }
                     } else if (bytes == 0) {
@@ -992,8 +1078,10 @@ int main(int argc, char** argv) {
                 }
             }
 
-            if (conn.response_ready) {
-                update_events(epfd, conn);
+            if (conn.response_ready &&
+                !update_events(epfd, conn)) {
+                close_connection(epfd, fd, connections);
+                continue;
             }
 
             if (conn.response_ready &&
@@ -1021,7 +1109,10 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                update_events(epfd, conn);
+                if (!update_events(epfd, conn)) {
+                    close_connection(epfd, fd, connections);
+                    continue;
+                }
             }
         }
 
