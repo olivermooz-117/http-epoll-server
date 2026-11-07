@@ -708,6 +708,7 @@ int main() {
     std::unordered_map<int, std::unique_ptr<Connection>> connections;
 
     epoll_event events[MAX_EVENTS];
+    Clock::time_point last_sweep = Clock::now();
 
     std::cout << "====================================\n";
     std::cout << "     EPOLL HTTP SERVER v0.4\n";
@@ -900,7 +901,12 @@ int main() {
             }
         }
 
-        cleanup_idle_connections(epfd, connections);
+        const auto now = Clock::now();
+
+        if (now - last_sweep >= std::chrono::seconds(1)) {
+            cleanup_idle_connections(epfd, connections);
+            last_sweep = now;
+        }
     }
 
     for (auto& item : connections) {
