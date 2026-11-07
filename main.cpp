@@ -633,12 +633,43 @@ void cleanup_idle_connections(
     }
 }
 
+bool send_response(int fd, Connection& conn) {
+    while (conn.write_offset < conn.write_buf.size()) {
+        ssize_t bytes = send(
+            fd,
+            conn.write_buf.data() + conn.write_offset,
+            conn.write_buf.size() - conn.write_offset,
+            MSG_NOSIGNAL
+        );
+
+        if (bytes > 0) {
+            conn.write_offset += static_cast<size_t>(bytes);
+            conn.last_activity = Clock::now();
+            continue;
+        }
+
+        if (bytes < 0 && errno == EINTR) {
+            continue;
+        }
+
+        if (bytes < 0 &&
+            (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
 void update_events(int epfd, Connection& conn) {
     epoll_event ev{};
 
     ev.events = EPOLLIN | EPOLLRDHUP;
 
-    if (conn.response_ready) {
+    if (conn.response_ready &&
+        conn.write_offset < conn.write_buf.size()) {
         ev.events |= EPOLLOUT;
     }
 
@@ -829,39 +860,15 @@ int main() {
             }
 
             if (conn.response_ready) {
-                update_events(epfd, conn);
-            }
-
-            if ((flags & EPOLLOUT) && conn.response_ready) {
-                while (conn.write_offset < conn.write_buf.size()) {
-                    ssize_t bytes = send(
-                        fd,
-                        conn.write_buf.data() + conn.write_offset,
-                        conn.write_buf.size() - conn.write_offset,
-                        MSG_NOSIGNAL
-                    );
-
-                    if (bytes > 0) {
-                        conn.write_offset +=
-                            static_cast<size_t>(bytes);
-
-                        conn.last_activity = Clock::now();
-                    } else if (bytes < 0 && errno == EINTR) {
-                        continue;
-                    } else if (bytes < 0 &&
-                               (errno == EAGAIN ||
-                                errno == EWOULDBLOCK)) {
-                        break;
-                    } else {
-                        failed = true;
-                        break;
-                    }
+                failed = send_response(fd, conn);
+                if (failed) {
+                    close_connection(epfd, fd, connections);
+                    continue;
                 }
             }
 
-            if (failed) {
-                close_connection(epfd, fd, connections);
-                continue;
+            if (conn.response_ready) {
+                update_events(epfd, conn);
             }
 
             if (conn.response_ready &&
@@ -880,6 +887,13 @@ int main() {
 
                 if (!conn.read_buf.empty()) {
                     prepare_response(conn);
+                    if (conn.response_ready) {
+                        failed = send_response(fd, conn);
+                        if (failed) {
+                            close_connection(epfd, fd, connections);
+                            continue;
+                        }
+                    }
                 }
 
                 update_events(epfd, conn);
