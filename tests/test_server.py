@@ -216,6 +216,13 @@ def test_http_validation():
     try:
         raw = raw_request(port, b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n")
         status_no_host, _, _ = parse_response(raw)
+
+        raw_empty_host = raw_request(
+            port,
+            b"GET / HTTP/1.1\r\nHost:   \r\nConnection: close\r\n\r\n"
+        )
+        status_empty_host, _, _ = parse_response(raw_empty_host)
+
         raw2 = raw_request(port, b"GET / HTTP/2.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         status_http2, _, _ = parse_response(raw2)
         raw3 = raw_request(port, b"GET / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
@@ -230,6 +237,7 @@ def test_http_validation():
         status_garbage, _, _ = parse_response(raw6)
         return (
             status_no_host == 400 and
+            status_empty_host == 400 and
             status_http2 == 505 and
             status_chunked == 501 and
             status_big_header == 431 and
@@ -339,6 +347,86 @@ def test_keep_alive_and_duplicate_headers():
         stop_server(proc)
 
 
+def test_v052_security_regressions():
+    binary_path = sys.argv[1] if len(sys.argv) > 1 else "./server_asan"
+    proc, port = start_server(binary_path)
+
+    if proc is None:
+        return False
+
+    link_path = os.path.join(
+        WWW_ROOT,
+        f".v052-outside-link-{os.getpid()}"
+    )
+
+    try:
+        # Verify that a symlink cannot expose files outside WWW_ROOT.
+        if os.path.lexists(link_path):
+            return False
+
+        os.symlink("/etc/passwd", link_path)
+
+        symlink_request = (
+            f"GET /{os.path.basename(link_path)} HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii")
+
+        symlink_response = raw_request(port, symlink_request)
+        symlink_status, _, symlink_body = parse_response(symlink_response)
+
+        if symlink_status != 400 or b"root:" in symlink_body:
+            print("Symlink regression failed:", symlink_status)
+            return False
+
+        # Verify that oversized input receives HTTP 413.
+        oversized_payload = b"A" * (1024 * 1024 + 1)
+        oversized_response = b""
+
+        with socket.create_connection(
+            ("127.0.0.1", port), timeout=10
+        ) as s:
+            s.settimeout(10)
+
+            try:
+                s.sendall(oversized_payload)
+            except (BrokenPipeError, ConnectionResetError):
+                # The server may close while sendall is still transmitting.
+                pass
+
+            while True:
+                try:
+                    chunk = s.recv(65536)
+                except socket.timeout:
+                    break
+                except ConnectionResetError:
+                    break
+
+                if not chunk:
+                    break
+
+                oversized_response += chunk
+
+        oversized_status, headers, body = parse_response(
+            oversized_response
+        )
+
+        if oversized_status != 413:
+            print("Oversized request regression failed:", oversized_status)
+            return False
+
+        return (
+            headers.get("connection") == "close"
+            and body == b"Content Too Large\n"
+        )
+
+    finally:
+        if os.path.lexists(link_path):
+            os.unlink(link_path)
+
+        stop_server(proc)
+
+
 def get_cpu_ticks(pid):
     with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
         data = handle.read().split()
@@ -431,6 +519,7 @@ if __name__ == "__main__":
         ("path traversal", test_path_traversal),
         ("split request + pipeline", test_split_request_and_pipeline),
         ("keep-alive + duplicate headers", test_keep_alive_and_duplicate_headers),
+        ("v0.5.2 security regressions", test_v052_security_regressions),
         ("CPU regression", test_cpu_regression),
         ("graceful shutdown", test_graceful_shutdown),
     ]
