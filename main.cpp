@@ -5,10 +5,12 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <csignal>
 
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -19,9 +21,10 @@
 #include <unordered_map>
 #include <vector>
 
-constexpr int PORT = 8080;
+constexpr int DEFAULT_PORT = 8080;
 constexpr int MAX_EVENTS = 1024;
 constexpr int BACKLOG = 128;
+constexpr const char* SERVER_VERSION = "0.5.1";
 
 constexpr size_t MAX_HEADER_SIZE = 16384;
 constexpr size_t MAX_BUFFER_SIZE = 1024 * 1024;
@@ -33,7 +36,9 @@ constexpr int EPOLL_WAIT_TIMEOUT_MS = 1000;
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
 
-const fs::path WWW_ROOT = "www";
+int SERVER_PORT = DEFAULT_PORT;
+fs::path WWW_ROOT = "www";
+bool QUIET_MODE = false;
 
 struct HttpRequest {
     std::string method;
@@ -75,7 +80,7 @@ bool set_nonblocking(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
 }
 
-int create_server_socket() {
+int create_server_socket(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
 
     if (fd < 0) {
@@ -91,7 +96,7 @@ int create_server_socket() {
 
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(PORT);
+    addr.sin_port = htons(port);
 
     if (bind(fd, reinterpret_cast<sockaddr*>(&addr),
              sizeof(addr)) < 0) {
@@ -160,6 +165,56 @@ bool contains_token(const std::string& value,
     }
 
     return false;
+}
+
+void print_usage(const char* program) {
+    std::cout << "Usage: " << program
+              << " [--quiet] [-p|--port <n>] [-r|--root <dir>] [--help]\n";
+    std::cout << "  --quiet              disable per-request and connection logs\n";
+    std::cout << "  -p, --port <n>      listen on port <n> (default: "
+              << DEFAULT_PORT << ")\n";
+    std::cout << "  -r, --root <dir>    serve files from <dir> (default: www)\n";
+    std::cout << "  --help              show this help message\n";
+}
+
+bool parse_command_line(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+
+        if (arg == "--quiet") {
+            QUIET_MODE = true;
+        } else if (arg == "-p" || arg == "--port") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: missing value for " << arg << "\n";
+                return false;
+            }
+
+            char* end = nullptr;
+            long port = std::strtol(argv[++i], &end, 10);
+
+            if (end == argv[i] || *end != '\0' || port <= 0 || port > 65535) {
+                std::cerr << "Error: invalid port: " << argv[i] << "\n";
+                return false;
+            }
+
+            SERVER_PORT = static_cast<int>(port);
+        } else if (arg == "-r" || arg == "--root") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: missing value for " << arg << "\n";
+                return false;
+            }
+
+            WWW_ROOT = argv[++i];
+        } else if (arg == "--help" || arg == "-h") {
+            print_usage(argv[0]);
+            std::exit(0);
+        } else {
+            std::cerr << "Error: unknown argument: " << arg << "\n";
+            return false;
+        }
+    }
+
+    return true;
 }
 
 ParseResult parse_request(
@@ -522,7 +577,7 @@ std::string make_response(
                  << "\r\n";
     }
 
-    response << "Server: epoll-http/0.4\r\n";
+    response << "Server: epoll-http/" << SERVER_VERSION << "\r\n";
     response << "\r\n";
 
     if (!head_request) {
@@ -589,11 +644,13 @@ void prepare_response(Connection& conn) {
             req.method == "HEAD"
         );
 
-        std::cout << req.method << " " << req.path
-                  << " -> " << (success ? 200 : status)
-                  << " [request " << conn.request_count << "]"
-                  << (conn.keep_alive ? " [keep-alive]" : " [close]")
-                  << "\n";
+        if (!QUIET_MODE) {
+            std::cout << req.method << " " << req.path
+                      << " -> " << (success ? 200 : status)
+                      << " [request " << conn.request_count << "]"
+                      << (conn.keep_alive ? " [keep-alive]" : " [close]")
+                      << "\n";
+        }
     }
 
     conn.write_offset = 0;
@@ -628,7 +685,9 @@ void cleanup_idle_connections(
     }
 
     for (int fd : expired) {
-        std::cout << "Connection timed out: " << fd << "\n";
+        if (!QUIET_MODE) {
+            std::cout << "Connection timed out: " << fd << "\n";
+        }
         close_connection(epfd, fd, connections);
     }
 }
@@ -678,8 +737,12 @@ void update_events(int epfd, Connection& conn) {
     epoll_ctl(epfd, EPOLL_CTL_MOD, conn.fd, &ev);
 }
 
-int main() {
-    int listen_fd = create_server_socket();
+int main(int argc, char** argv) {
+    if (!parse_command_line(argc, argv)) {
+        return 1;
+    }
+
+    int listen_fd = create_server_socket(SERVER_PORT);
 
     if (listen_fd < 0) return 1;
 
@@ -711,10 +774,10 @@ int main() {
     Clock::time_point last_sweep = Clock::now();
 
     std::cout << "====================================\n";
-    std::cout << "     EPOLL HTTP SERVER v0.4\n";
+    std::cout << "     EPOLL HTTP SERVER v" << SERVER_VERSION << "\n";
     std::cout << "====================================\n";
     std::cout << "Listening: http://127.0.0.1:"
-              << PORT << "\n";
+              << SERVER_PORT << "\n";
     std::cout << "Document root: " << WWW_ROOT << "\n";
     std::cout << "Keep-Alive timeout: "
               << KEEP_ALIVE_TIMEOUT_SECONDS << " seconds\n";
@@ -786,8 +849,10 @@ int main() {
                     connections[client_fd] =
                         std::make_unique<Connection>(client_fd);
 
-                    std::cout << "Client connected: "
-                              << client_fd << "\n";
+                    if (!QUIET_MODE) {
+                        std::cout << "Client connected: "
+                                  << client_fd << "\n";
+                    }
                 }
 
                 continue;
