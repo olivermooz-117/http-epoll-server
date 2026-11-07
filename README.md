@@ -10,7 +10,7 @@ This server is designed to demonstrate how an event-driven HTTP server can handl
 
 Unlike a traditional thread-per-connection architecture, the server uses a single event loop with `epoll` to monitor multiple client sockets.
 
-### Current Version: v0.5 — Performance Benchmarking
+### Current Version: v0.5.1 — HTTP correctness and CLI support
 
 The project currently includes:
 
@@ -56,10 +56,10 @@ Supported HTTP response status codes include:
 | 400 | Bad Request |
 | 404 | Not Found |
 | 405 | Method Not Allowed |
-| 413 | Content Too Large |
+| 413 | Content Too Large (request body) |
 | 414 | URI Too Long |
 | 431 | Request Header Fields Too Large |
-| 500 | Internal Server Error |
+| 500 | Internal Server Error (including oversized static files) |
 | 501 | Not Implemented |
 | 505 | HTTP Version Not Supported |
 
@@ -154,7 +154,11 @@ Start the server:
 ./server
 ```
 
-The C++ server listens on port `8080`.
+The C++ server listens on port `8080` by default. Custom ports and roots can be set with CLI options:
+
+```bash
+./server --port 8080 --root www --quiet
+```
 
 Open another terminal and test it:
 
