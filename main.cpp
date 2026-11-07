@@ -24,6 +24,7 @@
 constexpr int DEFAULT_PORT = 8080;
 constexpr int MAX_EVENTS = 1024;
 constexpr int BACKLOG = 128;
+constexpr int MAX_CONNECTIONS = 10000;
 constexpr const char* SERVER_VERSION = "0.5.1";
 
 constexpr size_t MAX_HEADER_SIZE = 16384;
@@ -39,6 +40,7 @@ using Clock = std::chrono::steady_clock;
 int SERVER_PORT = DEFAULT_PORT;
 fs::path WWW_ROOT = "www";
 bool QUIET_MODE = false;
+volatile sig_atomic_t SHUTDOWN_REQUESTED = 0;
 
 struct HttpRequest {
     std::string method;
@@ -301,11 +303,21 @@ ParseResult parse_request(
         name = lowercase(name);
 
         if (req.headers.count(name)) {
-            error_status = 400;
-            return ParseResult::INVALID;
+            if (name == "host" || name == "content-length") {
+                error_status = 400;
+                return ParseResult::INVALID;
+            }
+
+            req.headers[name] += ", " + value;
+            continue;
         }
 
         req.headers[name] = value;
+    }
+
+    if (req.path.size() > 8192) {
+        error_status = 414;
+        return ParseResult::INVALID;
     }
 
     if (req.version == "HTTP/1.1" &&
@@ -491,7 +503,7 @@ bool load_file(
         }
 
         if (fs::file_size(target) > 10 * 1024 * 1024) {
-            status = 413;
+            status = 500;
             return false;
         }
 
@@ -510,7 +522,7 @@ bool load_file(
             file_stat.st_size < 0 ||
             file_stat.st_size > 10 * 1024 * 1024) {
             close(file_fd);
-            status = 404;
+            status = (file_stat.st_size > 10 * 1024 * 1024) ? 500 : 404;
             return false;
         }
 
@@ -737,8 +749,35 @@ void update_events(int epfd, Connection& conn) {
     epoll_ctl(epfd, EPOLL_CTL_MOD, conn.fd, &ev);
 }
 
+void handle_shutdown(int) {
+    SHUTDOWN_REQUESTED = 1;
+}
+
+bool install_signal_handlers() {
+    struct sigaction sa{};
+    sa.sa_handler = handle_shutdown;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+
+    if (sigaction(SIGINT, &sa, nullptr) < 0) {
+        perror("sigaction(SIGINT)");
+        return false;
+    }
+
+    if (sigaction(SIGTERM, &sa, nullptr) < 0) {
+        perror("sigaction(SIGTERM)");
+        return false;
+    }
+
+    return true;
+}
+
 int main(int argc, char** argv) {
     if (!parse_command_line(argc, argv)) {
+        return 1;
+    }
+
+    if (!install_signal_handlers()) {
         return 1;
     }
 
@@ -786,7 +825,7 @@ int main(int argc, char** argv) {
     std::cout << "Methods: GET, HEAD\n";
     std::cout << "====================================\n";
 
-    while (true) {
+    while (!SHUTDOWN_REQUESTED) {
         int n = epoll_wait(
             epfd,
             events,
@@ -795,7 +834,12 @@ int main(int argc, char** argv) {
         );
 
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                if (SHUTDOWN_REQUESTED) {
+                    break;
+                }
+                continue;
+            }
 
             perror("epoll_wait");
             break;
@@ -824,8 +868,23 @@ int main(int argc, char** argv) {
 
                         if (errno == EINTR) continue;
 
+                        if (errno == EMFILE || errno == ENFILE) {
+                            static bool logged_accept_limit = false;
+
+                            if (!logged_accept_limit) {
+                                std::cerr << "Too many open files; skipping accept loop\n";
+                                logged_accept_limit = true;
+                            }
+                            break;
+                        }
+
                         perror("accept");
                         break;
+                    }
+
+                    if (connections.size() >= MAX_CONNECTIONS) {
+                        close(client_fd);
+                        continue;
                     }
 
                     if (!set_nonblocking(client_fd)) {
